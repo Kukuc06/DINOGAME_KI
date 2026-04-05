@@ -18,18 +18,18 @@
  */
 class GeneticAlgorithm {
   constructor({
-    populationSize        = 15,
-    mutationRate          = 0.15,
-    mutationScale         = 0.4,
-    eliteCount            = 2,
-    topology              = [7, 8, 2],
+    populationSize        = 20,
+    mutationRate          = 0.12,
+    mutationScale         = 0.25,
+    eliteCount            = 3,
+    topology              = [8, 8, 2],
     autoSaveEvery         = 5,
     maxCheckpoints        = 10,
-    crossoverRate         = 0.6,
+    crossoverRate         = 0.65,
     adaptiveMutation      = true,
     adaptiveMutationMin   = 0.05,
-    adaptiveMutationMax   = 0.50,
-    stagnationThreshold   = 5,
+    adaptiveMutationMax   = 0.40,
+    stagnationThreshold   = 4,
   } = {}) {
     this.populationSize       = populationSize;
     this.mutationRate         = mutationRate;
@@ -50,6 +50,7 @@ class GeneticAlgorithm {
     this.fitnesses            = new Array(populationSize).fill(0);
     this.allTimeBest          = null;
     this.allTimeBestFitness   = -Infinity;
+    this.allTimeBestRawScore  = 0;
     this.stagnantGens         = 0;
     this.hallOfFame           = [];   // top-5 all-time bests
     this.checkpoints          = [];   // in-memory list, newest first
@@ -74,14 +75,29 @@ class GeneticAlgorithm {
    * Record the score for the current individual and advance.
    * Triggers evolution automatically when the generation is complete.
    */
-  recordFitness(fitness) {
+  recordFitness(fitness, rawScore) {
     this.fitnesses[this.currentIndex] = fitness;
 
-    if (fitness > this.allTimeBestFitness) {
-      this.allTimeBestFitness = fitness;
-      this.allTimeBest = this.population[this.currentIndex].clone();
-      this._saveToStorage();
-      this._updateHallOfFame(fitness, this.allTimeBest);
+    try {
+      // Track top-5 by real game score (rawScore), not shaped fitness
+      const realScore = rawScore !== undefined ? rawScore : fitness;
+
+      if (fitness > this.allTimeBestFitness) {
+        this.allTimeBestFitness  = fitness;
+        this.allTimeBestRawScore = realScore;
+        this.allTimeBest = this.population[this.currentIndex].clone();
+        this._saveToStorage();
+      }
+      if (realScore > 0) {
+        const hofWorst = this.hallOfFame.length < 5
+          ? -Infinity
+          : this.hallOfFame[this.hallOfFame.length - 1].rawScore;
+        if (this.hallOfFame.length < 5 || realScore > hofWorst) {
+          this._updateHallOfFame(fitness, this.population[this.currentIndex], realScore);
+        }
+      }
+    } catch (err) {
+      console.error('[DinoBot] recordFitness error (individual ' + (this.currentIndex + 1) + '):', err);
     }
 
     this.currentIndex++;
@@ -187,15 +203,17 @@ class GeneticAlgorithm {
     nn.fromGenome(genome);
   }
 
-  _updateHallOfFame(fitness, nn) {
+  _updateHallOfFame(fitness, nn, rawScore) {
     this.hallOfFame.push({
       genome:     nn.toGenome(),
       topology:   this.topology,
       fitness,
+      rawScore,
       generation: this.generation,
       timestamp:  new Date().toLocaleTimeString(),
     });
-    this.hallOfFame.sort((a, b) => b.fitness - a.fitness);
+    // Sort and trim by real game score so HoF reflects what the user actually sees
+    this.hallOfFame.sort((a, b) => b.rawScore - a.rawScore);
     if (this.hallOfFame.length > 5) this.hallOfFame.pop();
     if (this.onCheckpoint) this.onCheckpoint();
   }
@@ -208,6 +226,7 @@ class GeneticAlgorithm {
       genome:     this.allTimeBest.toGenome(),
       topology:   this.topology,
       fitness:    Math.max(0, this.allTimeBestFitness),
+      rawScore:   this.allTimeBestRawScore,
       generation: this.generation,
       timestamp:  new Date().toLocaleTimeString(),
     });
@@ -236,8 +255,8 @@ class GeneticAlgorithm {
   loadCheckpoint(index) {
     const cp = this.checkpoints[index];
     if (!cp) return;
-    this._seedFromBest(new NeuralNetwork(cp.topology).fromGenome(cp.genome), cp.fitness, cp.generation);
-    console.log('[DinoBot] Loaded checkpoint — gen ' + cp.generation + ', score ' + Math.round(cp.fitness));
+    this._seedFromBest(new NeuralNetwork(cp.topology).fromGenome(cp.genome), cp.fitness, cp.generation, cp.rawScore);
+    console.log('[DinoBot] Loaded checkpoint — gen ' + cp.generation + ', score ' + (cp.rawScore || Math.round(cp.fitness)));
     if (this.onCheckpoint) this.onCheckpoint();
     if (this.onEvolve)     this.onEvolve();
   }
@@ -290,11 +309,13 @@ class GeneticAlgorithm {
             if (data.allTimeBestGenome) {
               this.allTimeBest        = new NeuralNetwork(data.topology).fromGenome(data.allTimeBestGenome);
               this.allTimeBestFitness = data.allTimeBestFitness;
+              this._updateHallOfFame(this.allTimeBestFitness, this.allTimeBest);
             }
             console.log('[DinoBot] Loaded full population — gen ' + data.generation);
           } else {
             const best = new NeuralNetwork(data.topology).fromGenome(data.genome);
             this._seedFromBest(best, data.fitness, data.generation);
+            this._updateHallOfFame(data.fitness, best);
             console.log('[DinoBot] Loaded best genome — gen ' + data.generation + ', score ' + Math.round(data.fitness));
           }
           this._addCheckpoint();
@@ -314,9 +335,10 @@ class GeneticAlgorithm {
     this.generation         = 1;
     this.currentIndex       = 0;
     this.fitnesses          = new Array(this.populationSize).fill(0);
-    this.allTimeBest        = null;
-    this.allTimeBestFitness = -Infinity;
-    this.stagnantGens       = 0;
+    this.allTimeBest         = null;
+    this.allTimeBestFitness  = -Infinity;
+    this.allTimeBestRawScore = 0;
+    this.stagnantGens        = 0;
     this.mutationRate       = this._baseMutationRate;
     this.checkpoints        = [];
     this.hallOfFame         = [];
@@ -343,10 +365,11 @@ class GeneticAlgorithm {
 
   // ── Helpers ────────────────────────────────────────────────────────────────
 
-  _seedFromBest(nn, fitness, generation) {
-    this.allTimeBest        = nn;
-    this.allTimeBestFitness = fitness;
-    this.generation         = generation;
+  _seedFromBest(nn, fitness, generation, rawScore) {
+    this.allTimeBest         = nn;
+    this.allTimeBestFitness  = fitness;
+    this.allTimeBestRawScore = rawScore !== undefined ? rawScore : Math.round(fitness);
+    this.generation          = generation;
     for (let i = 0; i < this.populationSize; i++) {
       const clone = nn.clone();
       if (i > 0) this._mutate(clone);
@@ -371,7 +394,8 @@ class GeneticAlgorithm {
     try {
       localStorage.setItem('dinoBotGenome', JSON.stringify({
         type: 'best', genome: this.allTimeBest.toGenome(),
-        topology: this.topology, fitness: this.allTimeBestFitness, generation: this.generation,
+        topology: this.topology, fitness: this.allTimeBestFitness,
+        rawScore: this.allTimeBestRawScore, generation: this.generation,
       }));
     } catch (_) {}
   }
@@ -383,8 +407,8 @@ class GeneticAlgorithm {
     try {
       const data = JSON.parse(raw);
       if (JSON.stringify(data.topology) !== JSON.stringify(this.topology)) return false;
-      this._seedFromBest(new NeuralNetwork(data.topology).fromGenome(data.genome), data.fitness, data.generation);
-      console.log('[DinoBot] Loaded saved genome — gen ' + data.generation + ', score ' + Math.round(data.fitness));
+      this._seedFromBest(new NeuralNetwork(data.topology).fromGenome(data.genome), data.fitness, data.generation, data.rawScore);
+      console.log('[DinoBot] Loaded saved genome — gen ' + data.generation + ', score ' + (data.rawScore || Math.round(data.fitness)));
       return true;
     } catch (_) { return false; }
   }
