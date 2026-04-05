@@ -13,27 +13,28 @@ window.DinoBot = (() => {
   const CANVAS_WIDTH   = 600;
   const CANVAS_HEIGHT  = 150;
   const MAX_SPEED      = 13;
-  const TOPOLOGY       = [7, 8, 2];
+  const TOPOLOGY       = [8, 8, 2];
   const POLL_MS        = 50;
   const CRASH_PAUSE_MS = 600;
+  const MAX_VEL        = 12;   // max dino vertical velocity (canvas units per tick)
 
-  const INPUT_LABELS = ['dist  ', 'width ', 'height', 'type  ', 'obs-y ', 'speed ', 'dino-y'];
+  const INPUT_LABELS = ['dist  ', 'width ', 'height', 'type  ', 'obs-y ', 'speed ', 'dino-y', 'vel-y '];
 
   // ── GA setup ───────────────────────────────────────────────────────────────
 
   const ga = new GeneticAlgorithm({
-    populationSize:       15,
-    mutationRate:         0.15,
-    mutationScale:        0.4,
-    eliteCount:           2,
+    populationSize:       20,
+    mutationRate:         0.12,
+    mutationScale:        0.25,
+    eliteCount:           3,
     topology:             TOPOLOGY,
     autoSaveEvery:        5,
     maxCheckpoints:       10,
-    crossoverRate:        0.6,
+    crossoverRate:        0.65,
     adaptiveMutation:     true,
     adaptiveMutationMin:  0.05,
-    adaptiveMutationMax:  0.50,
-    stagnationThreshold:  5,
+    adaptiveMutationMax:  0.40,
+    stagnationThreshold:  4,
   });
 
   ga.loadFromStorage();
@@ -74,11 +75,27 @@ window.DinoBot = (() => {
   let lastAction    = 'waiting...';
   let jumpOut       = 0;
   let duckOut       = 0;
-  let lastInputs    = [0, 0, 0, 0, 0, 0, 0];
+  let isDucking     = false;
+  let lastInputs    = [0, 0, 0, 0, 0, 0, 0, 0];
   let lastActivations = null;
-  let crashedAt     = null;
-  let forcedRunner  = null;
-  let runnerLogged  = false;
+
+  // Fitness shaping accumulators (reset on each run)
+  let speedIntegral      = 0;
+  let dodgeBonus         = 0;
+  let lastObstacleXPos   = Infinity;
+
+  // Vertical velocity tracking
+  let lastDinoY = 0;
+  let dinoVelY  = 0;
+
+  // Real game scores per individual for display (separate from shaped fitness)
+  let displayScores    = new Array(ga.populationSize).fill(0);
+  let rawAllTimeBest   = 0;   // best raw game score ever (for chart/legend)
+  let crashedAt          = null;
+  let forcedRunner       = null;
+  let runnerLogged       = false;
+  let pendingStop        = false;
+  let _lastGenPanelFull  = 0;   // timestamp of last full genPanel rebuild
 
   // ── Runner detection ───────────────────────────────────────────────────────
 
@@ -110,14 +127,19 @@ window.DinoBot = (() => {
     const obstacles = runner.horizon.obstacles;
     let dist = 1, width = 0, height = 0, type = 0, obsY = 0;
     if (obstacles && obstacles.length > 0) {
-      const obs = obstacles.reduce((a, b) => (b.xPos < a.xPos ? b : a));
-      dist   = Math.max(0, obs.xPos - DINO_X) / CANVAS_WIDTH;
-      width  = (obs.width || 0) / CANVAS_WIDTH;
-      height = (obs.typeConfig.height || 0) / CANVAS_HEIGHT;
-      type   = obs.typeConfig.type === 'PTERODACTYL' ? 1 : 0;
-      obsY   = obs.yPos / CANVAS_HEIGHT;
+      const ahead = obstacles.filter(o => o.xPos + (o.width || 0) > DINO_X);
+      if (ahead.length > 0) {
+        const obs = ahead.reduce((a, b) => (b.xPos < a.xPos ? b : a));
+        dist   = Math.max(0, obs.xPos - DINO_X) / CANVAS_WIDTH;
+        width  = (obs.width || 0) / CANVAS_WIDTH;
+        height = (obs.typeConfig.height || 0) / CANVAS_HEIGHT;
+        type   = (obs.typeConfig.type === 'PTERODACTYL' || (obs.typeConfig.numFrames || 1) > 1) ? 1 : 0;
+        obsY   = obs.yPos / CANVAS_HEIGHT;
+      }
     }
-    return [dist, width, height, type, obsY, runner.currentSpeed / MAX_SPEED, runner.tRex.yPos / CANVAS_HEIGHT];
+    // Vertical velocity: maps [-MAX_VEL, +MAX_VEL] → [0, 1]
+    const normVelY = Math.min(1, Math.max(0, (dinoVelY + MAX_VEL) / (2 * MAX_VEL)));
+    return [dist, width, height, type, obsY, runner.currentSpeed / MAX_SPEED, runner.tRex.yPos / CANVAS_HEIGHT, normVelY];
   }
 
   // ── Active network (accounts for replay / duel) ───────────────────────────
@@ -206,34 +228,118 @@ window.DinoBot = (() => {
           if (duelPhase === 1) { duelResults[0] = score; duelPhase = 2; }
           else if (duelPhase === 2) { duelResults[1] = score; duelPhase = 3; }
         } else {
-          ga.recordFitness(score);
+          displayScores[ga.currentIndex] = score;
+          if (score > rawAllTimeBest) rawAllTimeBest = score;
+          const fitness = Math.max(0, score + speedIntegral * 0.5 + dodgeBonus);
+          ga.recordFitness(fitness, score);
         }
-        currentScore = 0; jumpOut = 0; duckOut = 0;
+        currentScore = 0; jumpOut = 0; duckOut = 0; isDucking = false;
+        speedIntegral = 0; dodgeBonus = 0; lastObstacleXPos = Infinity;
+        lastDinoY = 0; dinoVelY = 0;
       }
       updateOverlay(); updateGenPanel(); drawBottomLeftCanvas();
       if (Date.now() - crashedAt >= CRASH_PAUSE_MS) {
-        crashedAt = null;
+        if (pendingStop) {
+          pendingStop = false;
+          clearInterval(intervalId); intervalId = null;
+          const r = getRunner(); if (r) gameDuck(r, false);
+          updateGenPanel();
+          return;  // leave crashedAt non-null so Resume skips re-recording fitness
+        }
         if (!(duelMode && duelPhase === 3)) gameRestart(runner);
       }
       return;
     }
 
+    // Game is running normally — safe to clear crash state now
+    crashedAt = null;
+
     currentScore  = getDisplayScore(runner);
+
+    // Vertical velocity (position delta between ticks)
+    const rawDinoY = runner.tRex.yPos;
+    dinoVelY = rawDinoY - lastDinoY;
+    lastDinoY = rawDinoY;
+
     lastInputs    = buildInputs(runner);
     const fwd     = getActiveNetwork().forwardWithActivations(lastInputs);
     lastActivations = fwd;
     const [jOut, dOut] = fwd.output;
     jumpOut = jOut; duckOut = dOut;
 
-    if (jumpOut > duckOut && jumpOut > 0.5) {
-      gameJump(runner); gameDuck(runner, false); lastAction = 'JUMP';
-    } else if (duckOut > jumpOut && duckOut > 0.5) {
-      gameDuck(runner, true); lastAction = 'DUCK';
+    if (runner.tRex.jumping) {
+      // Already airborne — trigger speed drop for a fast fall if the network wants it
+      if (duckOut > 0.5 && !runner.tRex.speedDrop) {
+        runner.tRex.setSpeedDrop(); lastAction = 'FALL';
+      } else {
+        lastAction = 'JUMP';
+      }
+      if (isDucking) { gameDuck(runner, false); isDucking = false; }
+    } else if (jumpOut > duckOut && jumpOut > 0.3) {
+      if (isDucking) { gameDuck(runner, false); isDucking = false; }
+      gameJump(runner); lastAction = 'JUMP';
+    } else if (duckOut > jumpOut && duckOut > 0.3) {
+      if (!isDucking) { gameDuck(runner, true); isDucking = true; }
+      lastAction = 'DUCK';
     } else {
-      gameDuck(runner, false); lastAction = 'run';
+      if (isDucking) { gameDuck(runner, false); isDucking = false; }
+      lastAction = 'run';
     }
 
-    updateOverlay(); updateGenPanel(); updateBottomLeftPanel();
+    // ── Fitness shaping accumulators ─────────────────────────────────────────
+    if (!replayMode && !duelMode) {
+      // Speed-weighted survival bonus
+      speedIntegral += (runner.currentSpeed / MAX_SPEED);
+
+      // Action-based reward: reward the correct action that got the dino past each obstacle
+      const obstacles = runner.horizon.obstacles;
+      const aheadObs = obstacles && obstacles.length > 0
+        ? obstacles.filter(o => o.xPos + (o.width || 0) > DINO_X)
+        : [];
+      const nearestObs = aheadObs.length > 0
+        ? aheadObs.reduce((a, b) => (b.xPos < a.xPos ? b : a))
+        : null;
+      if (nearestObs) {
+        if (lastObstacleXPos > DINO_X && nearestObs.xPos <= DINO_X) {
+          // Obstacle just cleared — reward only the action that caused it
+          const isPtero = (nearestObs.typeConfig.type === 'PTERODACTYL' || (nearestObs.typeConfig.numFrames || 1) > 1);
+          if (!isPtero) {
+            if (runner.tRex.jumping) dodgeBonus += 100;           // jumped over cactus
+          } else if (nearestObs.yPos > CANVAS_HEIGHT * 0.5) {
+            if (isDucking) dodgeBonus += 100;                     // ducked under low bird
+          } else {
+            if (!runner.tRex.jumping && !isDucking) dodgeBonus += 75; // ran under high bird
+          }
+        }
+        lastObstacleXPos = nearestObs.xPos;
+      } else {
+        lastObstacleXPos = Infinity;
+      }
+
+    }
+
+    updateOverlay(); tickGenPanel(); drawBottomLeftCanvas();
+  }
+
+  // Lightweight per-tick genPanel update: only rebuilds the full panel every 400 ms
+  // so header buttons stay stable long enough to be clicked.
+  function tickGenPanel() {
+    const now = Date.now();
+    if (now - _lastGenPanelFull >= 400) {
+      _lastGenPanelFull = now;
+      updateGenPanel();
+    } else {
+      // just patch the live score bar of the current individual in-place
+      const bar = genPanel && genPanel.querySelector('[data-live-bar]');
+      if (bar) {
+        const scores  = displayScores.slice(0, ga.currentIndex);
+        const maxScore = Math.max(...scores, currentScore, 1);
+        const pct = Math.min(100, Math.round((currentScore / maxScore) * 100));
+        bar.style.width = pct + '%';
+      }
+      const scoreEl = genPanel && genPanel.querySelector('[data-live-score]');
+      if (scoreEl) scoreEl.textContent = String(currentScore).padStart(4, '\u00a0');
+    }
   }
 
   // ── Main HUD (top-right) ──────────────────────────────────────────────────
@@ -244,7 +350,7 @@ window.DinoBot = (() => {
   }
 
   function actionColor(a) {
-    return a === 'JUMP' ? '#ffff00' : a === 'DUCK' ? '#00aaff' : a === 'DEAD' ? '#ff4444' : '#39ff14';
+    return a === 'JUMP' ? '#ffff00' : a === 'DUCK' ? '#00aaff' : a === 'FALL' ? '#ff9900' : a === 'DEAD' ? '#ff4444' : '#39ff14';
   }
 
   function createOverlay() {
@@ -277,11 +383,6 @@ window.DinoBot = (() => {
 
     overlay.innerHTML = [
       '<b style="color:#fff;font-size:13px">DINO BOT' + modeBadge + '</b>',
-      '<span style="color:#666">Gen ' + s.generation + '  #' + s.individual + ' / ' + s.populationSize + '</span>',
-      '',
-      'Score    : <b>' + Math.round(currentScore) + '</b>',
-      'Gen best : ' + s.generationBest,
-      'All-time : ' + s.allTimeBest,
       '<span style="color:#666;font-size:11px">mut: ' + mutStr + '</span>',
       '',
       '<span style="color:#aaa">── INPUTS ──────────────────</span>',
@@ -413,26 +514,46 @@ window.DinoBot = (() => {
         if (btn.dataset.action === 'competition') toggleCompetition();
         if (btn.dataset.action === 'resumetrain') exitCompetition();
         if (btn.dataset.action === 'endduel')     exitDuelMode();
+        if (btn.dataset.action === 'stopbot') {
+          pendingStop = true;
+          updateGenPanel();
+        }
+        if (btn.dataset.action === 'cancelstop') {
+          pendingStop = false;
+          updateGenPanel();
+        }
+        if (btn.dataset.action === 'startbot') {
+          pendingStop = false;
+          if (!intervalId) { intervalId = setInterval(tick, POLL_MS); }
+          updateGenPanel();
+        }
         return;
       }
       if (e.target.closest('[data-toggle]')) { genExpanded = !genExpanded; updateGenPanel(); }
     });
 
     ga.onEvolve = () => {
-      const s = ga.getStats();
-      genBestHistory.push(s.generationBest);
-      allTimeBestHist.push(s.allTimeBest);
+      // Capture raw scores before reset — these are the real game scores for the chart
+      const rawGenBest = Math.round(Math.max(...displayScores, 0));
+      displayScores = new Array(ga.populationSize).fill(0);
+      genBestHistory.push(rawGenBest);
+      allTimeBestHist.push(rawAllTimeBest);
+      // Stamp the just-created checkpoint with the true session high score up to this gen
+      if (ga.autoSaveEvery > 0 && ga.generation % ga.autoSaveEvery === 0 && ga.checkpoints.length > 0) {
+        ga.checkpoints[0].rawScore = rawAllTimeBest;
+      }
       updateGenPanel();
       updateBottomLeftPanel();
     };
 
     ga.onGenerationComplete = () => {
       competitionDone    = true;
-      competitionResults = ga.fitnesses
+      competitionResults = displayScores
         .map((score, i) => ({ individual: i + 1, score }))
         .sort((a, b) => b.score - a.score);
+      clearInterval(intervalId);
+      intervalId = null;
       updateGenPanel();
-      stop();
     };
 
     document.body.appendChild(genPanel);
@@ -440,11 +561,12 @@ window.DinoBot = (() => {
   }
 
   function updateGenPanel() {
+    _lastGenPanelFull = Date.now();
     if (!genPanel) return;
     const s     = ga.getStats();
     const arrow = genExpanded ? '▲' : '▼';
 
-    const scores   = ga.fitnesses.slice(0, ga.currentIndex);
+    const scores   = displayScores.slice(0, ga.currentIndex);
     const maxScore = Math.max(...scores, currentScore, 1);
 
     // ── Header ──────────────────────────────────────────────────────────────
@@ -453,13 +575,26 @@ window.DinoBot = (() => {
     else if (duelMode)     modeLabel = '<span style="color:#00ffff"> ⚔ DUEL</span>';
     else if (replayMode)   modeLabel = '<span style="color:#ff8c00"> ▶ REPLAY</span>';
 
+    let stopBtnHtml = '';
+    if (!intervalId) {
+      stopBtnHtml = '<button data-action="startbot" style="' + BTN('#1a4a2a') + '">Resume</button>';
+    } else if (pendingStop) {
+      stopBtnHtml =
+        '<button data-action="cancelstop" style="' + BTN('#4a4a00') + '">Stopping…</button>';
+    } else {
+      stopBtnHtml = '<button data-action="stopbot" style="' + BTN('#4a2a2a') + '">Stop</button>';
+    }
+
     let rightBtns = '';
     if (duelMode) {
-      rightBtns = '<button data-action="endduel" style="' + BTN('#4a0000') + '">✕ End Duel</button>';
+      rightBtns =
+        stopBtnHtml +
+        '<button data-action="endduel" style="' + BTN('#4a0000') + '">✕ End Duel</button>';
     } else {
       const compBtnTxt = competitionActive ? '✕ Exit' : '⚔ Compete';
       const compBtnClr = competitionActive ? '#6b2a1a' : '#4a3a00';
       rightBtns =
+        stopBtnHtml +
         '<button data-action="newgen"      style="' + BTN('#3a1a1a') + '">+ New</button>' +
         '<button data-action="savegen"     style="' + BTN('#1a3a6b') + '">&#8595; Save</button>' +
         '<button data-action="competition" style="' + BTN(compBtnClr) + '">' + compBtnTxt + '</button>';
@@ -538,7 +673,7 @@ window.DinoBot = (() => {
     for (let i = 0; i < ga.populationSize; i++) {
       const isDone    = i < ga.currentIndex;
       const isCurrent = i === ga.currentIndex;
-      const score     = isDone ? ga.fitnesses[i] : (isCurrent ? currentScore : 0);
+      const score     = isDone ? displayScores[i] : (isCurrent ? currentScore : 0);
       const pct       = Math.min(100, Math.round((score / maxScore) * 100));
 
       const numColor  = isDone ? '#39ff14' : isCurrent ? '#ffff00' : '#444';
@@ -567,9 +702,9 @@ window.DinoBot = (() => {
         '<div style="padding:3px 14px;display:flex;align-items:center;gap:6px' + (isCurrent ? ';background:#1a1a00' : '') + '">' +
         '<span style="color:#555;width:20px;text-align:right">#' + (i + 1) + '</span>' +
         badge +
-        '<span style="color:' + numColor + ';width:34px;text-align:right">' + scoreText + '</span>' +
+        '<span style="color:' + numColor + ';width:34px;text-align:right"' + (isCurrent ? ' data-live-score' : '') + '>' + scoreText + '</span>' +
         '<div style="flex:1;background:#1a1a1a;height:8px;border-radius:3px;overflow:hidden;border:1px solid ' + barColor + '">' +
-          '<div style="width:' + pct + '%;height:100%;background:' + fillColor + ';border-radius:3px;transition:width 0.1s"></div>' +
+          '<div ' + (isCurrent ? 'data-live-bar ' : '') + 'style="width:' + pct + '%;height:100%;background:' + fillColor + ';border-radius:3px;transition:width 0.1s"></div>' +
         '</div>' +
         '<span style="color:' + numColor + ';width:14px;text-align:center">' + label + '</span>' +
         from +
@@ -590,7 +725,7 @@ window.DinoBot = (() => {
   function createCheckpointPanel() {
     cpPanel = document.createElement('div');
     Object.assign(cpPanel.style, {
-      position: 'fixed', bottom: '10px', right: '10px',
+      position: 'fixed', bottom: '10px', right: '640px',
       background: '#111', color: '#39ff14',
       fontFamily: 'monospace', fontSize: '12px', lineHeight: '1.7',
       borderRadius: '6px', border: '1px solid #333',
@@ -634,7 +769,7 @@ window.DinoBot = (() => {
             '<div style="padding:5px 14px;border-bottom:1px solid #1a1a1a;display:flex;align-items:center">' +
             '<span style="flex:1;color:#aaa">' +
               'Gen <b style="color:#fff">' + String(cp.generation).padStart(3, '\u00a0') + '</b>' +
-              ' &nbsp;|&nbsp; <b style="color:#39ff14">' + Math.round(cp.fitness) + '</b> pts' +
+              ' &nbsp;|&nbsp; <b style="color:#39ff14">' + (cp.rawScore || Math.round(cp.fitness)) + '</b> pts' +
               ' &nbsp;|&nbsp; <span style="color:#555">' + cp.timestamp + '</span>' +
             '</span>' +
             '<button data-action="dl"   data-idx="' + i + '" style="' + BTN('#1a6b2a') + '">&#8595; Save</button>' +
@@ -652,7 +787,7 @@ window.DinoBot = (() => {
   function createHofPanel() {
     hofPanel = document.createElement('div');
     Object.assign(hofPanel.style, {
-      position: 'fixed', bottom: '10px', left: '330px',
+      position: 'fixed', bottom: '10px', right: '330px',
       background: '#111', color: '#39ff14',
       fontFamily: 'monospace', fontSize: '12px', lineHeight: '1.7',
       borderRadius: '6px', border: '1px solid #333',
@@ -701,12 +836,11 @@ window.DinoBot = (() => {
             '<div style="padding:5px 14px;border-bottom:1px solid #1a1a1a;display:flex;align-items:center;gap:6px">' +
             '<span style="color:' + rankColor + ';width:18px">' + medals[i] + '</span>' +
             '<span style="flex:1;color:#aaa">' +
-              '<b style="color:#39ff14">' + Math.round(entry.fitness) + '</b> pts' +
+              '<b style="color:#39ff14">' + entry.rawScore + '</b> pts' +
               ' &nbsp;·&nbsp; <span style="color:#555">gen ' + entry.generation + '</span>' +
               ' &nbsp;·&nbsp; <span style="color:#333">' + entry.timestamp + '</span>' +
             '</span>' +
             '<button data-action="hofDl"     data-idx="' + i + '" style="' + BTN('#1a6b2a') + '">&#8595;</button>' +
-            '<button data-action="hofReplay" data-idx="' + i + '" style="' + BTN('#4a3a00') + '">&#9654; Play</button>' +
             '</div>';
         });
       }
@@ -720,7 +854,7 @@ window.DinoBot = (() => {
   function createBottomLeftPanel() {
     blPanel = document.createElement('div');
     Object.assign(blPanel.style, {
-      position: 'fixed', bottom: '10px', left: '10px',
+      position: 'fixed', bottom: '10px', right: '10px',
       background: '#111', color: '#39ff14',
       fontFamily: 'monospace', fontSize: '12px',
       borderRadius: '6px', border: '1px solid #333',
@@ -738,16 +872,19 @@ window.DinoBot = (() => {
     blCanvas.style.cssText = 'display:block;padding:6px 8px';
     blBody.appendChild(blCanvas);
 
-    blHeader.addEventListener('click', (e) => {
-      const btn = e.target.closest('button');
-      if (btn) {
-        blTab = btn.dataset.tab || blTab;
+    blPanel.addEventListener('click', (e) => {
+      const tabBtn = e.target.closest('button[data-tab]');
+      if (tabBtn) {
+        blTab = tabBtn.dataset.tab;
+        if (!blExpanded) { blExpanded = true; blBody.style.display = 'block'; }
         updateBottomLeftPanel();
         return;
       }
-      blExpanded = !blExpanded;
-      blBody.style.display = blExpanded ? 'block' : 'none';
-      updateBottomLeftPanel();
+      if (e.target.closest('[data-collapse]')) {
+        blExpanded = !blExpanded;
+        blBody.style.display = blExpanded ? 'block' : 'none';
+        updateBottomLeftPanel();
+      }
     });
 
     blPanel.appendChild(blHeader);
@@ -767,7 +904,7 @@ window.DinoBot = (() => {
       '<button data-tab="fitness" style="' + BTN(fitActive  ? '#2a5a2a' : '#1a2a1a') + '">Fitness</button>' +
       '<button data-tab="network" style="' + BTN(netActive  ? '#2a5a2a' : '#1a2a1a') + '">Network</button>' +
       '<button data-tab="origins" style="' + BTN(origActive ? '#2a5a2a' : '#1a2a1a') + '">Origins</button>' +
-      '<span style="color:#666;margin-left:6px;cursor:pointer">' + arrow + '</span>';
+      '<span data-collapse style="color:#666;margin-left:6px;cursor:pointer">' + arrow + '</span>';
     drawBottomLeftCanvas();
   }
 
@@ -786,75 +923,111 @@ window.DinoBot = (() => {
     ctx.fillStyle = '#0a0a0a';
     ctx.fillRect(0, 0, W, H);
 
-    if (genBestHistory.length < 2) {
+    if (genBestHistory.length < 1) {
       ctx.fillStyle = '#444';
       ctx.font = '11px monospace';
       ctx.textAlign = 'center';
-      ctx.fillText('Waiting for data (need 2+ gens)...', W / 2, H / 2);
+      ctx.fillText('Waiting for first generation...', W / 2, H / 2);
       return;
     }
 
-    const pad     = { left: 38, right: 8, top: 18, bottom: 20 };
-    const cW      = W - pad.left - pad.right;
-    const cH      = H - pad.top - pad.bottom;
-    const n       = genBestHistory.length;
-    const maxVal  = Math.max(...allTimeBestHist, 1);
+    const pad    = { left: 38, right: 8, top: 18, bottom: 20 };
+    const cW     = W - pad.left - pad.right;
+    const cH     = H - pad.top - pad.bottom;
+    const n      = genBestHistory.length;
+    const maxVal = Math.max(...allTimeBestHist, 1);
 
-    const xPos = (i) => pad.left + (n > 1 ? (i / (n - 1)) * cW : cW / 2);
-    const yPos = (v) => pad.top + cH - (v / maxVal) * cH;
+    const yPos   = (v) => pad.top + cH - (v / maxVal) * cH;
 
-    // Grid
-    ctx.strokeStyle = '#1a1a1a';
-    ctx.lineWidth   = 1;
+    // Bar width with a small gap
+    const barW   = Math.max(2, Math.floor(cW / n) - 1);
+    const barX   = (i) => pad.left + (i / n) * cW;
+
+    // Y-axis grid lines + labels
+    ctx.font      = '9px monospace';
+    ctx.textAlign = 'right';
     for (let t = 0; t <= 4; t++) {
-      const yy = pad.top + (t / 4) * cH;
+      const val = Math.round((maxVal / 4) * (4 - t));
+      const yy  = pad.top + (t / 4) * cH;
+      ctx.strokeStyle = '#1a1a1a'; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(pad.left, yy); ctx.lineTo(W - pad.right, yy); ctx.stroke();
+      ctx.fillStyle = '#444';
+      ctx.fillText(val, pad.left - 3, yy + 3);
     }
 
-    // Y-axis labels
-    ctx.fillStyle  = '#444';
-    ctx.font       = '9px monospace';
-    ctx.textAlign  = 'right';
-    ctx.fillText(maxVal, pad.left - 3, pad.top + 4);
-    ctx.fillText('0',    pad.left - 3, pad.top + cH + 3);
+    // Bars — one per generation + inline score labels
+    // Decide label frequency so text never overlaps (min ~22 px per label)
+    const labelEvery = Math.max(1, Math.ceil(22 / Math.max(1, barW)));
 
-    // All-time best line (green)
+    genBestHistory.forEach((v, i) => {
+      const x      = barX(i);
+      const isLast = i === n - 1;
+      const bTop   = yPos(v);
+      const barH   = Math.max(1, cH - (bTop - pad.top));
+
+      // Bar fill
+      ctx.fillStyle = isLast ? '#484848' : '#252525';
+      ctx.fillRect(x, bTop, barW, barH);
+
+      // Score label
+      if (v === 0) return;
+      const showLabel = isLast || (i % labelEvery === 0);
+      if (!showLabel) return;
+
+      ctx.save();
+      ctx.font = isLast ? 'bold 9px monospace' : '8px monospace';
+      ctx.textAlign = 'center';
+      const cx = x + barW / 2;
+
+      if (barW >= 22 && barH >= 14) {
+        // Inside the bar — centered vertically
+        ctx.fillStyle = isLast ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.3)';
+        ctx.fillText(v, cx, bTop + barH / 2 + 3);
+      } else if (barW >= 10) {
+        // Above the bar
+        ctx.fillStyle = isLast ? '#fff' : '#555';
+        ctx.fillText(v, cx, bTop - 3);
+      } else {
+        // Very narrow bars — rotate label, only for last bar
+        if (!isLast) { ctx.restore(); return; }
+        ctx.translate(cx, bTop - 4);
+        ctx.rotate(-Math.PI / 2);
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#fff';
+        ctx.fillText(v, 2, 0);
+      }
+      ctx.restore();
+    });
+
+    // All-time best as a step function (green) — only ever goes up
     ctx.strokeStyle = '#39ff14';
     ctx.lineWidth   = 2;
     ctx.beginPath();
     allTimeBestHist.forEach((v, i) => {
-      i === 0 ? ctx.moveTo(xPos(i), yPos(v)) : ctx.lineTo(xPos(i), yPos(v));
+      const x = barX(i);
+      if (i === 0) {
+        ctx.moveTo(x, yPos(v));
+      } else {
+        ctx.lineTo(x, yPos(v));   // horizontal: carry previous value to this gen's x
+      }
+      ctx.lineTo(x + barW, yPos(v)); // extend to right edge of this bar
     });
     ctx.stroke();
 
-    // Gen best line (yellow, dashed)
-    ctx.strokeStyle = '#ffff00';
-    ctx.lineWidth   = 1.5;
-    ctx.setLineDash([3, 3]);
-    ctx.beginPath();
-    genBestHistory.forEach((v, i) => {
-      i === 0 ? ctx.moveTo(xPos(i), yPos(v)) : ctx.lineTo(xPos(i), yPos(v));
-    });
-    ctx.stroke();
-    ctx.setLineDash([]);
+    // X-axis: generation numbers
+    ctx.font = '9px monospace'; ctx.fillStyle = '#444'; ctx.textAlign = 'center';
+    ctx.fillText('1', barX(0) + barW / 2, H - 5);
+    if (n > 1) ctx.fillText(n, barX(n - 1) + barW / 2, H - 5);
+    if (n > 4) {
+      const mid = Math.floor(n / 2);
+      ctx.fillText(mid + 1, barX(mid) + barW / 2, H - 5);
+    }
 
-    // Dots on latest values
-    const drawDot = (x, y, color) => {
-      ctx.fillStyle = color;
-      ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
-    };
-    drawDot(xPos(n - 1), yPos(allTimeBestHist[n - 1]), '#39ff14');
-    drawDot(xPos(n - 1), yPos(genBestHistory[n - 1]),  '#ffff00');
-
-    // X-axis labels
-    ctx.fillStyle = '#444'; ctx.textAlign = 'center';
-    ctx.fillText('1',   xPos(0),   H - 5);
-    ctx.fillText('gen ' + n, xPos(n - 1), H - 5);
-
-    // Legend
+    // Legend with current values — scores shown here, not floating on the chart
+    const atb     = allTimeBestHist[n - 1];
     ctx.font = '9px monospace'; ctx.textAlign = 'left';
-    ctx.fillStyle = '#39ff14'; ctx.fillText('── all-time', pad.left, pad.top - 5);
-    ctx.fillStyle = '#ffff00'; ctx.fillText('-- gen best', pad.left + 72, pad.top - 5);
+    ctx.fillStyle = '#39ff14';
+    ctx.fillText('── record: ' + atb, pad.left, pad.top - 5);
   }
 
   function drawNetworkDiagram(canvas) {
@@ -922,7 +1095,7 @@ window.DinoBot = (() => {
     });
 
     // Input labels
-    const inLabels = ['dist', 'wid', 'hgt', 'typ', 'oby', 'spd', 'dy'];
+    const inLabels = ['dist', 'wid', 'hgt', 'typ', 'oby', 'spd', 'dy', 'vly'];
     ctx.fillStyle  = '#555'; ctx.font = '8px monospace'; ctx.textAlign = 'right';
     nodes[0].forEach(({ x, y }, j) => ctx.fillText(inLabels[j], x - R - 3, y + 3));
 
@@ -1044,7 +1217,7 @@ window.DinoBot = (() => {
       ctx.fillText(badge, xCur - R - 2, y + 3);
 
       // Score label (right of dot)
-      const scoreVal = isDone ? ga.fitnesses[i] : (isCurrent ? currentScore : null);
+      const scoreVal = isDone ? displayScores[i] : (isCurrent ? currentScore : null);
       if (scoreVal !== null) {
         ctx.fillStyle = isDone ? '#aaa' : '#ffff00';
         ctx.font = '8px monospace'; ctx.textAlign = 'left';
@@ -1069,11 +1242,11 @@ window.DinoBot = (() => {
 
   function start() {
     if (intervalId) { console.log('[DinoBot] Already running.'); return; }
-    createOverlay();
-    createGenPanel();
-    createCheckpointPanel();
-    createHofPanel();
-    createBottomLeftPanel();
+    if (!overlay)   createOverlay();
+    if (!genPanel)  createGenPanel();
+    if (!cpPanel)   createCheckpointPanel();
+    if (!hofPanel)  createHofPanel();
+    if (!blPanel)   createBottomLeftPanel();
     intervalId = setInterval(tick, POLL_MS);
     console.log(
       '[DinoBot] Started.\n' +
