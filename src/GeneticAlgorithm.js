@@ -7,49 +7,57 @@
  *   1. Call getCurrentNetwork() to get the network for the current individual.
  *   2. Let it play until it dies, then call recordFitness(score).
  *   3. Repeat until the whole population has been evaluated.
- *   4. evolve() is called automatically — selects elites, produces offspring
- *      via tournament selection + Gaussian mutation.
+ *   4. _evolve() is called automatically — selects elites, produces offspring
+ *      via crossover + tournament selection + Gaussian mutation.
  *   5. A checkpoint is stored in memory every autoSaveEvery generations.
+ *
+ * New in v2:
+ *   - crossoverRate: probability of crossover vs pure mutation (default 0.6)
+ *   - adaptiveMutation: auto-adjusts mutationRate based on stagnation
+ *   - hallOfFame: top-5 all-time best genomes with timestamps
  */
 class GeneticAlgorithm {
-  /**
-   * @param {object}   opts
-   * @param {number}   opts.populationSize   Individuals per generation (default 15)
-   * @param {number}   opts.mutationRate     Probability of mutating each gene (default 0.15)
-   * @param {number}   opts.mutationScale    Std-dev of Gaussian noise on mutation (default 0.4)
-   * @param {number}   opts.eliteCount       Top individuals that survive unchanged (default 2)
-   * @param {number[]} opts.topology         NN layer sizes, e.g. [7, 8, 2]
-   * @param {number}   opts.autoSaveEvery    Store a checkpoint every N generations (default 5)
-   * @param {number}   opts.maxCheckpoints   Max checkpoints kept in memory (default 10)
-   */
   constructor({
-    populationSize  = 15,
-    mutationRate    = 0.15,
-    mutationScale   = 0.4,
-    eliteCount      = 2,
-    topology        = [7, 8, 2],
-    autoSaveEvery   = 5,
-    maxCheckpoints  = 10,
+    populationSize        = 15,
+    mutationRate          = 0.15,
+    mutationScale         = 0.4,
+    eliteCount            = 2,
+    topology              = [7, 8, 2],
+    autoSaveEvery         = 5,
+    maxCheckpoints        = 10,
+    crossoverRate         = 0.6,
+    adaptiveMutation      = true,
+    adaptiveMutationMin   = 0.05,
+    adaptiveMutationMax   = 0.50,
+    stagnationThreshold   = 5,
   } = {}) {
-    this.populationSize  = populationSize;
-    this.mutationRate    = mutationRate;
-    this.mutationScale   = mutationScale;
-    this.eliteCount      = eliteCount;
-    this.topology        = topology;
-    this.autoSaveEvery   = autoSaveEvery;
-    this.maxCheckpoints  = maxCheckpoints;
+    this.populationSize       = populationSize;
+    this.mutationRate         = mutationRate;
+    this._baseMutationRate    = mutationRate;
+    this.mutationScale        = mutationScale;
+    this.eliteCount           = eliteCount;
+    this.topology             = topology;
+    this.autoSaveEvery        = autoSaveEvery;
+    this.maxCheckpoints       = maxCheckpoints;
+    this.crossoverRate        = crossoverRate;
+    this.adaptiveMutation     = adaptiveMutation;
+    this.adaptiveMutationMin  = adaptiveMutationMin;
+    this.adaptiveMutationMax  = adaptiveMutationMax;
+    this.stagnationThreshold  = stagnationThreshold;
 
-    this.generation         = 1;
-    this.currentIndex       = 0;
-    this.fitnesses          = new Array(populationSize).fill(0);
-    this.allTimeBest        = null;
-    this.allTimeBestFitness = -Infinity;
-    this.checkpoints           = []; // in-memory list, newest first
-    this.evolutionLog          = null; // set after each _evolve(): origins of current gen
-    this.competitionMode       = false; // when true, generation completes without evolving
-    this.onCheckpoint          = null; // called when checkpoint list changes
-    this.onEvolve              = null; // called when a new generation starts
-    this.onGenerationComplete  = null; // called when all individuals have played (competition mode)
+    this.generation           = 1;
+    this.currentIndex         = 0;
+    this.fitnesses            = new Array(populationSize).fill(0);
+    this.allTimeBest          = null;
+    this.allTimeBestFitness   = -Infinity;
+    this.stagnantGens         = 0;
+    this.hallOfFame           = [];   // top-5 all-time bests
+    this.checkpoints          = [];   // in-memory list, newest first
+    this.evolutionLog         = null; // set after each _evolve()
+    this.competitionMode      = false;
+    this.onCheckpoint         = null; // fired when checkpoint/HoF list changes
+    this.onEvolve             = null; // fired when a new generation starts
+    this.onGenerationComplete = null; // fired after all individuals play (competition)
 
     this.population = Array.from(
       { length: populationSize },
@@ -73,6 +81,7 @@ class GeneticAlgorithm {
       this.allTimeBestFitness = fitness;
       this.allTimeBest = this.population[this.currentIndex].clone();
       this._saveToStorage();
+      this._updateHallOfFame(fitness, this.allTimeBest);
     }
 
     this.currentIndex++;
@@ -90,6 +99,8 @@ class GeneticAlgorithm {
   _evolve() {
     this.generation++;
 
+    const fitnessBefore = this.allTimeBestFitness;
+
     const ranked = this.population
       .map((nn, i) => ({ nn, fitness: this.fitnesses[i] }))
       .sort((a, b) => b.fitness - a.fitness);
@@ -104,19 +115,41 @@ class GeneticAlgorithm {
       origins.push({ type: 'elite', prevScore: ranked[i].fitness });
     }
 
-    // Fill rest with mutated tournament winners
+    // Fill rest with crossover or mutation
     while (next.length < this.populationSize) {
-      const winner = this._tournamentSelect(ranked);
-      const child  = winner.nn.clone();
-      this._mutate(child);
-      next.push(child);
-      origins.push({ type: 'offspring', prevScore: winner.fitness });
+      if (this.crossoverRate > 0 && Math.random() < this.crossoverRate && ranked.length >= 2) {
+        const parentA = this._tournamentSelect(ranked);
+        const parentB = this._tournamentSelect(ranked);
+        const child   = this._crossover(parentA.nn, parentB.nn);
+        this._mutate(child);
+        next.push(child);
+        origins.push({ type: 'crossover', prevScoreA: parentA.fitness, prevScoreB: parentB.fitness });
+      } else {
+        const winner = this._tournamentSelect(ranked);
+        const child  = winner.nn.clone();
+        this._mutate(child);
+        next.push(child);
+        origins.push({ type: 'offspring', prevScore: winner.fitness });
+      }
     }
 
-    this.population    = next;
-    this.fitnesses     = new Array(this.populationSize).fill(0);
-    this.currentIndex  = 0;
-    this.evolutionLog  = { prevFitnesses, origins };
+    this.population   = next;
+    this.fitnesses    = new Array(this.populationSize).fill(0);
+    this.currentIndex = 0;
+    this.evolutionLog = { prevFitnesses, origins };
+
+    // Adaptive mutation rate
+    if (this.adaptiveMutation) {
+      if (this.allTimeBestFitness > fitnessBefore) {
+        this.stagnantGens = 0;
+        this.mutationRate = Math.max(this.adaptiveMutationMin, this.mutationRate * 0.9);
+      } else {
+        this.stagnantGens++;
+        if (this.stagnantGens >= this.stagnationThreshold) {
+          this.mutationRate = Math.min(this.adaptiveMutationMax, this.mutationRate * 1.3);
+        }
+      }
+    }
 
     if (this.autoSaveEvery > 0 && this.generation % this.autoSaveEvery === 0) {
       this._addCheckpoint();
@@ -133,6 +166,15 @@ class GeneticAlgorithm {
     return best; // { nn, fitness }
   }
 
+  _crossover(nnA, nnB) {
+    const genomeA = nnA.toGenome();
+    const genomeB = nnB.toGenome();
+    const point   = Math.floor(Math.random() * genomeA.length);
+    return new NeuralNetwork(this.topology).fromGenome(
+      genomeA.slice(0, point).concat(genomeB.slice(point))
+    );
+  }
+
   _mutate(nn) {
     const genome = nn.toGenome();
     for (let i = 0; i < genome.length; i++) {
@@ -143,6 +185,19 @@ class GeneticAlgorithm {
       }
     }
     nn.fromGenome(genome);
+  }
+
+  _updateHallOfFame(fitness, nn) {
+    this.hallOfFame.push({
+      genome:     nn.toGenome(),
+      topology:   this.topology,
+      fitness,
+      generation: this.generation,
+      timestamp:  new Date().toLocaleTimeString(),
+    });
+    this.hallOfFame.sort((a, b) => b.fitness - a.fitness);
+    if (this.hallOfFame.length > 5) this.hallOfFame.pop();
+    if (this.onCheckpoint) this.onCheckpoint();
   }
 
   // ── Checkpoints ────────────────────────────────────────────────────────────
@@ -169,6 +224,15 @@ class GeneticAlgorithm {
     );
   }
 
+  downloadHallOfFame(index) {
+    const entry = this.hallOfFame[index];
+    if (!entry) return;
+    this._download(
+      { type: 'best', genome: entry.genome, topology: entry.topology, fitness: entry.fitness, generation: entry.generation },
+      `dino_hof${index + 1}_gen${entry.generation}_score${Math.round(entry.fitness)}.json`
+    );
+  }
+
   loadCheckpoint(index) {
     const cp = this.checkpoints[index];
     if (!cp) return;
@@ -180,7 +244,6 @@ class GeneticAlgorithm {
 
   // ── File export ────────────────────────────────────────────────────────────
 
-  /** Download the all-time best genome as a single-best JSON file. */
   exportToFile() {
     if (!this.allTimeBest) { console.warn('[DinoBot] No best genome yet.'); return; }
     this._download(
@@ -191,15 +254,14 @@ class GeneticAlgorithm {
     console.log('[DinoBot] Saved dino_genome.json (gen ' + this.generation + ', score ' + Math.round(this.allTimeBestFitness) + ')');
   }
 
-  /** Download the entire current population so training can resume exactly. */
   exportPopulationToFile() {
     this._download(
       { type: 'population',
-        genomes:    this.population.map(nn => nn.toGenome()),
-        fitnesses:  this.fitnesses.slice(),
-        topology:   this.topology,
-        generation: this.generation,
-        currentIndex: this.currentIndex,
+        genomes:             this.population.map(nn => nn.toGenome()),
+        fitnesses:           this.fitnesses.slice(),
+        topology:            this.topology,
+        generation:          this.generation,
+        currentIndex:        this.currentIndex,
         allTimeBestGenome:   this.allTimeBest ? this.allTimeBest.toGenome() : null,
         allTimeBestFitness:  this.allTimeBestFitness,
       },
@@ -208,10 +270,6 @@ class GeneticAlgorithm {
     console.log('[DinoBot] Saved full population (gen ' + this.generation + ')');
   }
 
-  /**
-   * Open a file picker and load either a single-best or full-population file.
-   * Detects the file type automatically via the `type` field.
-   */
   importFromFile() {
     const input = Object.assign(document.createElement('input'), { type: 'file', accept: '.json' });
     input.onchange = (e) => {
@@ -225,7 +283,6 @@ class GeneticAlgorithm {
             console.error('[DinoBot] Topology mismatch.'); return;
           }
           if (data.type === 'population') {
-            // Restore full population
             this.population   = data.genomes.map(g => new NeuralNetwork(data.topology).fromGenome(g));
             this.fitnesses    = data.fitnesses.slice();
             this.generation   = data.generation;
@@ -236,12 +293,11 @@ class GeneticAlgorithm {
             }
             console.log('[DinoBot] Loaded full population — gen ' + data.generation);
           } else {
-            // Single best genome — seed population from it
             const best = new NeuralNetwork(data.topology).fromGenome(data.genome);
             this._seedFromBest(best, data.fitness, data.generation);
             console.log('[DinoBot] Loaded best genome — gen ' + data.generation + ', score ' + Math.round(data.fitness));
           }
-          this._addCheckpoint(); // imported session appears in checkpoints panel
+          this._addCheckpoint();
           if (this.onCheckpoint) this.onCheckpoint();
           if (this.onEvolve)     this.onEvolve();
         } catch (err) { console.error('[DinoBot] Failed to parse file:', err); }
@@ -260,7 +316,10 @@ class GeneticAlgorithm {
     this.fitnesses          = new Array(this.populationSize).fill(0);
     this.allTimeBest        = null;
     this.allTimeBestFitness = -Infinity;
+    this.stagnantGens       = 0;
+    this.mutationRate       = this._baseMutationRate;
     this.checkpoints        = [];
+    this.hallOfFame         = [];
     this.population = Array.from({ length: this.populationSize }, () => new NeuralNetwork(this.topology));
     console.log('[DinoBot] Training reset.');
     if (this.onCheckpoint) this.onCheckpoint();
@@ -277,6 +336,8 @@ class GeneticAlgorithm {
       populationSize: this.populationSize,
       generationBest: evaluated.length ? Math.round(Math.max(...evaluated)) : 0,
       allTimeBest:    Math.round(this.allTimeBestFitness < 0 ? 0 : this.allTimeBestFitness),
+      mutationRate:   this.mutationRate,
+      stagnantGens:   this.stagnantGens,
     };
   }
 

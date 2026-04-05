@@ -52,23 +52,6 @@ class NeuralNetwork {
     return { output: activation, layerActivations };
   }
 
-  /** @deprecated use forwardWithActivations internally */
-  _forwardOld(inputs) {
-    let activation = inputs.slice();
-    for (let l = 0; l < this.weights.length; l++) {
-      const next = [];
-      for (let j = 0; j < this.weights[l].length; j++) {
-        let sum = this.biases[l][j];
-        for (let k = 0; k < this.weights[l][j].length; k++) {
-          sum += this.weights[l][j][k] * activation[k];
-        }
-        next.push(NeuralNetwork.sigmoid(sum));
-      }
-      activation = next;
-    }
-    return activation;
-  }
-
   static sigmoid(x) {
     return 1 / (1 + Math.exp(-x));
   }
