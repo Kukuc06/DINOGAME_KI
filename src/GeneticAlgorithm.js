@@ -22,7 +22,7 @@ class GeneticAlgorithm {
     mutationRate          = 0.12,
     mutationScale         = 0.25,
     eliteCount            = 3,
-    topology              = [8, 8, 2],
+    topology              = [12, 8, 2],
     autoSaveEvery         = 5,
     maxCheckpoints        = 10,
     crossoverRate         = 0.65,
@@ -162,10 +162,23 @@ class GeneticAlgorithm {
       } else {
         this.stagnantGens++;
         if (this.stagnantGens >= this.stagnationThreshold) {
-          this.mutationRate = Math.min(this.adaptiveMutationMax, this.mutationRate * 1.3);
+          // If mutation is already high, do a partial reset of the weakest individuals
+          // instead of just cranking mutation further — avoids destroying refined elites
+          if (this.mutationRate >= this.adaptiveMutationMax * 0.75) {
+            const resetCount = Math.floor(this.populationSize * 0.25);
+            for (let i = this.population.length - resetCount; i < this.population.length; i++) {
+              this.population[i] = new NeuralNetwork(this.topology);
+            }
+            this.stagnantGens = 0;
+          } else {
+            this.mutationRate = Math.min(this.adaptiveMutationMax, this.mutationRate * 1.3);
+          }
         }
       }
     }
+
+    // Diversity maintenance: if genomes have converged too closely, inject fresh individuals
+    this._maintainDiversity();
 
     if (this.autoSaveEvery > 0 && this.generation % this.autoSaveEvery === 0) {
       this._addCheckpoint();
@@ -203,12 +216,41 @@ class GeneticAlgorithm {
     nn.fromGenome(genome);
   }
 
+  _maintainDiversity() {
+    // Compute average pairwise L1 genome distance among non-elite individuals.
+    // If the population has collapsed (all genomes nearly identical), replace the
+    // weakest quarter with fresh random networks to restore exploration.
+    const genomes = this.population.slice(this.eliteCount).map(nn => nn.toGenome());
+    if (genomes.length < 2) return;
+
+    let totalDist = 0;
+    let pairs = 0;
+    for (let i = 0; i < genomes.length; i++) {
+      for (let j = i + 1; j < genomes.length; j++) {
+        let d = 0;
+        for (let k = 0; k < genomes[i].length; k++) d += Math.abs(genomes[i][k] - genomes[j][k]);
+        totalDist += d / genomes[i].length; // normalize by genome length
+        pairs++;
+      }
+    }
+    const avgDist = totalDist / pairs;
+
+    // Threshold: if average per-weight difference is below 0.05, genomes are too similar
+    if (avgDist < 0.05) {
+      const resetCount = Math.floor(this.populationSize * 0.25);
+      for (let i = this.population.length - resetCount; i < this.population.length; i++) {
+        this.population[i] = new NeuralNetwork(this.topology);
+      }
+    }
+  }
+
   _updateHallOfFame(fitness, nn, rawScore) {
+    const score = rawScore !== undefined ? rawScore : Math.round(fitness);
     this.hallOfFame.push({
       genome:     nn.toGenome(),
       topology:   this.topology,
       fitness,
-      rawScore,
+      rawScore:   score,
       generation: this.generation,
       timestamp:  new Date().toLocaleTimeString(),
     });
@@ -309,13 +351,13 @@ class GeneticAlgorithm {
             if (data.allTimeBestGenome) {
               this.allTimeBest        = new NeuralNetwork(data.topology).fromGenome(data.allTimeBestGenome);
               this.allTimeBestFitness = data.allTimeBestFitness;
-              this._updateHallOfFame(this.allTimeBestFitness, this.allTimeBest);
+              this._updateHallOfFame(this.allTimeBestFitness, this.allTimeBest, data.allTimeBestRawScore);
             }
             console.log('[DinoBot] Loaded full population — gen ' + data.generation);
           } else {
             const best = new NeuralNetwork(data.topology).fromGenome(data.genome);
-            this._seedFromBest(best, data.fitness, data.generation);
-            this._updateHallOfFame(data.fitness, best);
+            this._seedFromBest(best, data.fitness, data.generation, data.rawScore);
+            this._updateHallOfFame(data.fitness, best, data.rawScore);
             console.log('[DinoBot] Loaded best genome — gen ' + data.generation + ', score ' + Math.round(data.fitness));
           }
           this._addCheckpoint();
