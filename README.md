@@ -6,7 +6,7 @@ A neural network that learns to play the Chrome Dino game using a **genetic algo
 
 ### Neural network
 
-A feedforward network (**12 inputs → 8 hidden → 2 outputs**) with sigmoid activations controls the dino. All inputs are normalised to [0, 1].
+A feedforward network (**13 inputs → 8 hidden → 2 outputs**) with sigmoid activations controls the dino. All inputs are normalised to [0, 1].
 
 **Inputs:**
 
@@ -24,6 +24,7 @@ A feedforward network (**12 inputs → 8 hidden → 2 outputs**) with sigmoid ac
 | 9 | `dino-y` | Dino on the ground | Dino at top of jump |
 | 10 | `vel-y` | Maximum downward velocity | Maximum upward velocity |
 | 11 | `duck` | Not ducking | Currently ducking |
+| 12 | `width1` | No width | Obstacle 1 spans its maximum width |
 
 **Outputs:** `[jump, duck]`
 
@@ -199,14 +200,24 @@ DINOGAME_KI/
 │   ├── NeuralNetwork.js     — feedforward NN, sigmoid activation, genome serialisation
 │   ├── GeneticAlgorithm.js  — selection, crossover, mutation, diversity maintenance, checkpoints
 │   └── DinoBot.js           — game interface, input vector, reward shaping, all overlays, main loop
-└── dino_bot.js              — single bundled file (paste this into the browser console)
+├── dino_bot.js              — single bundled file (paste this into the browser console)
+├── build.js                 — build script (concatenates src/ files into dino_bot.js)
+└── package.json
 ```
 
-After editing `src/` files, rebuild the bundle:
+### Building
+
+After editing any file in `src/`, rebuild the bundle with:
 
 ```bash
-cat src/NeuralNetwork.js src/GeneticAlgorithm.js src/DinoBot.js > dino_bot.js
+node build.js
 ```
+
+This concatenates the three source files in order into `dino_bot.js`. No dependencies are installed — it uses Node's built-in `fs` module.
+
+> **Windows / PowerShell note:** if you get an execution policy error with `npm run build`, use `node build.js` directly instead.
+
+Requirements: [Node.js](https://nodejs.org) (any modern version).
 
 ---
 
@@ -224,7 +235,7 @@ All parameters are at the top of `DinoBot.js` (constants) and in the `GeneticAlg
 | `adaptiveMutationMin` | 0.05 | Floor for mutation rate |
 | `adaptiveMutationMax` | 0.40 | Ceiling before partial reset kicks in |
 | `stagnationThreshold` | 4 | Stagnant generations before boosting mutation |
-| `topology` | `[12, 8, 2]` | Network shape — add neurons/layers for more capacity |
+| `topology` | `[13, 8, 2]` | Network shape — add neurons/layers for more capacity |
 | `autoSaveEvery` | 5 | Checkpoint interval in generations |
 | `POLL_MS` | 50 | Game polling interval in milliseconds |
 | `CRASH_PAUSE_MS` | 600 | Pause after a crash before restarting |

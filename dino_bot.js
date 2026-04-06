@@ -87,6 +87,7 @@ class NeuralNetwork {
     return new NeuralNetwork(this.topology).fromGenome(this.toGenome());
   }
 }
+
 /**
  * GeneticAlgorithm
  *
@@ -177,7 +178,6 @@ class GeneticAlgorithm {
         this.allTimeBest = this.population[this.currentIndex].clone();
         this._saveToStorage();
       }
-
       if (realScore > 0) {
         const hofWorst = this.hallOfFame.length < 5
           ? -Infinity
@@ -335,11 +335,12 @@ class GeneticAlgorithm {
   }
 
   _updateHallOfFame(fitness, nn, rawScore) {
+    const score = rawScore !== undefined ? rawScore : Math.round(fitness);
     this.hallOfFame.push({
       genome:     nn.toGenome(),
       topology:   this.topology,
       fitness,
-      rawScore,
+      rawScore:   score,
       generation: this.generation,
       timestamp:  new Date().toLocaleTimeString(),
     });
@@ -440,13 +441,13 @@ class GeneticAlgorithm {
             if (data.allTimeBestGenome) {
               this.allTimeBest        = new NeuralNetwork(data.topology).fromGenome(data.allTimeBestGenome);
               this.allTimeBestFitness = data.allTimeBestFitness;
-              this._updateHallOfFame(this.allTimeBestFitness, this.allTimeBest);
+              this._updateHallOfFame(this.allTimeBestFitness, this.allTimeBest, data.allTimeBestRawScore);
             }
             console.log('[DinoBot] Loaded full population — gen ' + data.generation);
           } else {
             const best = new NeuralNetwork(data.topology).fromGenome(data.genome);
-            this._seedFromBest(best, data.fitness, data.generation);
-            this._updateHallOfFame(data.fitness, best);
+            this._seedFromBest(best, data.fitness, data.generation, data.rawScore);
+            this._updateHallOfFame(data.fitness, best, data.rawScore);
             console.log('[DinoBot] Loaded best genome — gen ' + data.generation + ', score ' + Math.round(data.fitness));
           }
           this._addCheckpoint();
@@ -470,7 +471,7 @@ class GeneticAlgorithm {
     this.allTimeBestFitness  = -Infinity;
     this.allTimeBestRawScore = 0;
     this.stagnantGens        = 0;
-    this.mutationRate        = this._baseMutationRate;
+    this.mutationRate       = this._baseMutationRate;
     this.checkpoints        = [];
     this.hallOfFame         = [];
     this.population = Array.from({ length: this.populationSize }, () => new NeuralNetwork(this.topology));
@@ -544,6 +545,7 @@ class GeneticAlgorithm {
     } catch (_) { return false; }
   }
 }
+
 /**
  * DinoBot — main controller (v2)
  *
@@ -559,12 +561,12 @@ window.DinoBot = (() => {
   const CANVAS_WIDTH   = 600;
   const CANVAS_HEIGHT  = 150;
   const MAX_SPEED      = 13;
-  const TOPOLOGY       = [12, 8, 2];
+  const TOPOLOGY       = [13, 8, 2];
   const POLL_MS        = 50;
   const CRASH_PAUSE_MS = 600;
   const MAX_VEL        = 12;   // max dino vertical velocity (canvas units per tick)
 
-  const INPUT_LABELS = ['dist1 ', 'ttc   ', 'type1 ', 'obs-y ', 'hgt   ', 'dist2 ', 'type2 ', 'gap   ', 'speed ', 'dino-y', 'vel-y ', 'duck  '];
+  const INPUT_LABELS = ['dist1 ', 'ttc   ', 'type1 ', 'obs-y ', 'hgt   ', 'dist2 ', 'type2 ', 'gap   ', 'speed ', 'dino-y', 'vel-y ', 'duck  ', 'width '];
 
   // ── GA setup ───────────────────────────────────────────────────────────────
 
@@ -622,13 +624,16 @@ window.DinoBot = (() => {
   let jumpOut       = 0;
   let duckOut       = 0;
   let isDucking     = false;
-  let lastInputs    = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  let wasJumping    = false;   // tracks previous-tick jump state to detect landing frame
+  let lastInputs    = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
   let lastActivations = null;
 
   // Fitness shaping accumulators (reset on each run)
   let speedIntegral      = 0;
   let dodgeBonus         = 0;
   let lastObstacleXPos   = Infinity;
+  let airTicksAfterClear    = -1;   // -1 = not tracking; ≥0 = ticks airborne since obstacle cleared
+  let fallRewardedAfterClear = false; // prevent rewarding FALL more than once per cactus
 
   // Vertical velocity tracking
   let lastDinoY = 0;
@@ -668,6 +673,7 @@ window.DinoBot = (() => {
   }
 
   // ── Input vector ───────────────────────────────────────────────────────────
+
   function buildInputs(runner) {
     const obstacles = runner.horizon.obstacles;
     const speed = runner.currentSpeed || 1;
@@ -680,7 +686,7 @@ window.DinoBot = (() => {
 
     if (obstacles && obstacles.length > 0) {
       // Filter obstacles that are still ahead of the Dino
-      const ahead = obstacles.filter(o => (o.xPos + (o.width || 0) * o.size) > DINO_X);
+      const ahead = obstacles.filter(o => (o.xPos + o.typeConfig.width * o.size) > DINO_X);
 
       if (ahead.length > 0) {
         const first = ahead[0];
@@ -689,18 +695,18 @@ window.DinoBot = (() => {
         obs1.dist = Math.max(0, first.xPos - DINO_X) / CANVAS_WIDTH;
         obs1.width = (first.typeConfig.width * first.size) / CANVAS_WIDTH;
         obs1.height = (first.typeConfig.height) / CANVAS_HEIGHT;
-        obs1.type = (first.typeConfig.type === 'PTERODACTYL') ? 1 : 0;
+        obs1.type = (first.typeConfig.type === 'PTERODACTYL' || (first.typeConfig.numFrames || 1) > 1) ? 1 : 0;
         obs1.y = first.yPos / CANVAS_HEIGHT;
 
         // TTC: Time-to-Collision, normalized to [0,1] (1 = far away, 0 = impact)
         obs1.ttc = Math.min(1, (obs1.dist * CANVAS_WIDTH) / (speed * 20));
 
 
-        // --- Secondary Obstacle Lookahead ---
+        // Secondary Obstacle Lookahead
         if (ahead.length > 1) {
           const second = ahead[1];
           obs2.dist = (second.xPos - DINO_X) / CANVAS_WIDTH;
-          obs2.type = (second.typeConfig.type === 'PTERODACTYL') ? 1 : 0;
+          obs2.type = (second.typeConfig.type === 'PTERODACTYL' || (second.typeConfig.numFrames || 1) > 1) ? 1 : 0;
           gap = (second.xPos - (first.xPos + (first.typeConfig.width * first.size))) / CANVAS_WIDTH;
         }
       }
@@ -710,18 +716,19 @@ window.DinoBot = (() => {
     const normVelY = Math.min(1, Math.max(0, (dinoVelY + MAX_VEL) / (2 * MAX_VEL)));
 
     return [
-      obs1.dist,                  // 0: Distance to 1st
+      obs1.dist,                  // 0: Distance to 1st obstacle
       obs1.ttc,                   // 1: Time to impact
-      obs1.type,                  // 2: Is bird? (Boolean)
-      obs1.y,                     // 3: Bird height (Y-coord)
+      obs1.type,                  // 2: Is bird?
+      obs1.y,                     // 3: Obstacle Y-coord
       obs1.height,                // 4: Obstacle height (size)
-      obs2.dist,                  // 5: Distance to 2nd
-      obs2.type,                  // 6: Type of 2nd
-      gap,                        // 7: Distance between obs 1 and 2
+      obs2.dist,                  // 5: Distance to 2nd obstacle
+      obs2.type,                  // 6: Type of 2nd obstacle
+      gap,                        // 7: Gap between obstacle 1 and 2
       speed / MAX_SPEED,          // 8: Current game speed
       DINO_Y / CANVAS_HEIGHT,     // 9: Dino's current height
-      normVelY,                   // 10: Jumping/Falling momentum
-      runner.tRex.ducking ? 1 : 0 // 11: Currently ducking?
+      normVelY,                   // 10: Vertical momentum
+      runner.tRex.ducking ? 1 : 0, // 11: Currently ducking?
+      obs1.width,                  // 12: Width of 1st obstacle (normalized)
     ];
   }
 
@@ -816,8 +823,8 @@ window.DinoBot = (() => {
           const fitness = Math.max(0, score + speedIntegral * 0.5 + dodgeBonus);
           ga.recordFitness(fitness, score);
         }
-        currentScore = 0; jumpOut = 0; duckOut = 0; isDucking = false;
-        speedIntegral = 0; dodgeBonus = 0; lastObstacleXPos = Infinity;
+        currentScore = 0; jumpOut = 0; duckOut = 0; isDucking = false; wasJumping = false;
+        speedIntegral = 0; dodgeBonus = 0; lastObstacleXPos = Infinity; airTicksAfterClear = -1; fallRewardedAfterClear = false;
         lastDinoY = 0; dinoVelY = 0;
       }
       updateOverlay(); updateGenPanel(); drawBottomLeftCanvas();
@@ -850,19 +857,28 @@ window.DinoBot = (() => {
     const [jOut, dOut] = fwd.output;
     jumpOut = jOut; duckOut = dOut;
 
+    // Always sync local duck state with actual game state to prevent divergence
+    isDucking = runner.tRex.ducking;
+
+    const justLanded = wasJumping && !runner.tRex.jumping;
+    wasJumping = runner.tRex.jumping;
+
     if (runner.tRex.jumping) {
       // Already airborne — trigger speed drop for a fast fall if the network wants it
       if (duckOut > jumpOut && duckOut > 0.5 && !runner.tRex.speedDrop) {
         runner.tRex.setSpeedDrop(); lastAction = 'FALL';
+      } else if (jumpOut <= 0.5 && duckOut <= 0.5) {
+        runner.tRex.endJump();      lastAction = 'LAND';  // short-hop: cut jump early
       } else {
         lastAction = 'JUMP';
       }
       if (isDucking) { gameDuck(runner, false); isDucking = false; }
-    }
-    else if (jumpOut > duckOut && jumpOut > 0.5) {
+    } else if (jumpOut > duckOut && jumpOut > 0.5) {
       if (isDucking) { gameDuck(runner, false); isDucking = false; }
       gameJump(runner); lastAction = 'JUMP';
-    } else if (duckOut > jumpOut && duckOut > 0.5) {
+    } else if (duckOut > jumpOut && duckOut > 0.5 && !justLanded) {
+      // Skip duck on the landing frame — the game needs one tick to settle into
+      // RUNNING state after landing (especially after a speed drop / FALL).
       if (!isDucking) { gameDuck(runner, true); isDucking = true; }
       lastAction = 'DUCK';
     } else {
@@ -871,72 +887,71 @@ window.DinoBot = (() => {
     }
 
     // ── Fitness shaping accumulators ─────────────────────────────────────────
-    // Initialization (Run this once outside your main loop/update function)
-    if (typeof this.clearedObstacles === 'undefined') {
-      this.clearedObstacles = new Set();
-    }
-
     if (!replayMode && !duelMode) {
-      // 1. Speed-weighted survival bonus
-      // Always accumulating based on current speed vs max potential speed
-      speedIntegral += (runner.currentSpeed / (MAX_SPEED));
+      // Speed-weighted survival bonus
+      speedIntegral += (runner.currentSpeed / MAX_SPEED);
 
+      // Action-based reward: reward the correct action that got the dino past each obstacle
       const obstacles = runner.horizon.obstacles;
-      const DINO_X = runner.tRex.xPos;
-
-      // Clean up the set when the game restarts
-      if (runner.playCount !== this.lastPlayCount) {
-        this.clearedObstacles.clear();
-        this.lastPlayCount = runner.playCount;
-      }
-
-      // 2. Action-based reward logic
-      if (obstacles && obstacles.length > 0) {
-        // We check all obstacles on screen, not just the "nearest" one,
-        // to ensure we don't miss a reward if they are close together.
-        obstacles.forEach((obs) => {
-          const obstacleWidth = obs.typeConfig.width * obs.size;
-          const obstacleRightEdge = obs.xPos + obstacleWidth;
-
-          // CONDITION: If the dino's front is past the obstacle's back...
-          // AND we haven't rewarded this specific obstacle instance yet...
-          // AND the dino hasn't crashed (no rewards for dying!).
-          if (obstacleRightEdge < DINO_X && !this.clearedObstacles.has(obs) && !runner.crashed) {
-
-            const isPtero = obs.typeConfig.type === 'PTERODACTYL';
-
-            if (!isPtero) {
-              // CACTUS: Perfect jump reward
-              if (runner.tRex.jumping) {
-                dodgeBonus += 100;
-              } else {
-                // Edge case: if it "glitched" past or moved through safely while grounded
-                dodgeBonus += 20;
-              }
-            } else {
-              // PTERODACTYL: Height-based logic
-              // Low bird: Y is high (e.g., > 80), must DUCK
-              if (obs.yPos > 75) {
-                if (runner.tRex.ducking) dodgeBonus += 100;
-                else dodgeBonus += 10;
-              }
-              // Mid bird: Y is middle (e.g., ~50-70), must DUCK or JUMP
-              else if (obs.yPos > 40) {
-                if (runner.tRex.ducking || runner.tRex.jumping) dodgeBonus += 100;
-              }
-              // High bird: Y is low (e.g., < 40), must STAND STILL
-              else {
-                if (!runner.tRex.jumping && !runner.tRex.ducking) dodgeBonus += 100;
-                else dodgeBonus -= 20; // Penalty for unnecessary jumping/ducking
-              }
-            }
-
-            // Mark this obstacle as "Done" so it doesn't trigger again next frame
-            this.clearedObstacles.add(obs);
+      const aheadObs = obstacles && obstacles.length > 0
+        ? obstacles.filter(o => o.xPos + o.typeConfig.width * o.size > DINO_X)
+        : [];
+      const nearestObs = aheadObs.length > 0
+        ? aheadObs.reduce((a, b) => (b.xPos < a.xPos ? b : a))
+        : null;
+      if (nearestObs) {
+        if (lastObstacleXPos > DINO_X && nearestObs.xPos <= DINO_X) {
+          // Obstacle just cleared — reward only the action that caused it
+          const isPtero = (nearestObs.typeConfig.type === 'PTERODACTYL' || (nearestObs.typeConfig.numFrames || 1) > 1);
+          if (!isPtero) {
+            if (runner.tRex.jumping) { dodgeBonus += 100; airTicksAfterClear = 0; fallRewardedAfterClear = false; } // jumped over cactus — start fast-landing timer
+          } else if (nearestObs.yPos > CANVAS_HEIGHT * 0.5) {
+            if (isDucking) dodgeBonus += 100;                     // ducked under low bird
+            else dodgeBonus += 10;                                // survived low bird without ducking
+          } else if (nearestObs.yPos > 40) {
+            // Mid bird — duck or jump are both valid; start fast-landing timer if jumped
+            if (isDucking || runner.tRex.jumping) dodgeBonus += 100;
+            if (runner.tRex.jumping) { airTicksAfterClear = 0; fallRewardedAfterClear = false; }
+          } else {
+            // High bird — correct action is to do nothing (run under)
+            if (!runner.tRex.jumping && !isDucking) dodgeBonus += 100; // ran under high bird
+            else dodgeBonus -= 20;                                      // jumped/ducked unnecessarily
           }
-        });
+        }
+        lastObstacleXPos = nearestObs.xPos;
+      } else {
+        lastObstacleXPos = Infinity;
       }
+
+      // Reward calm running when no action is required
+      if (lastAction === 'run') {
+        const noThreat = !nearestObs || lastInputs[0] > 0.4; // dist1 > 40% of canvas (~240 px)
+        if (noThreat) dodgeBonus += 10;
+      }
+
+      // Penalise unnecessary air time — encourages landing quickly after obstacles
+      if (runner.tRex.jumping) {
+        const noThreat = !nearestObs || lastInputs[0] > 0.4;
+        if (noThreat) dodgeBonus -= 1;
+      }
+
+      // Fast-landing bonus: reward landing quickly after clearing a cactus
+      if (airTicksAfterClear >= 0) {
+        if (runner.tRex.jumping) {
+          // Reward the FALL action (speed-drop) once per cactus clear
+          if (lastAction === 'FALL' && !fallRewardedAfterClear) {
+            dodgeBonus += 50;
+            fallRewardedAfterClear = true;
+          }
+          airTicksAfterClear++;
+        } else {
+          dodgeBonus += Math.max(0, 50 - airTicksAfterClear * 4);
+          airTicksAfterClear = -1;
+        }
+      }
+
     }
+
     updateOverlay(); tickGenPanel(); drawBottomLeftCanvas();
   }
 
@@ -988,7 +1003,7 @@ window.DinoBot = (() => {
 
   function updateOverlay() {
     if (!overlay) return;
-    const s        = ga.getStats();
+    const s       = ga.getStats();
     const obs1Type = lastInputs[2] > 0.5 ? 'ptero' : 'cactus';
     const obs2Type = lastInputs[6] > 0.5 ? 'ptero' : 'cactus';
 
@@ -1002,10 +1017,9 @@ window.DinoBot = (() => {
 
     const mutStr = (s.mutationRate * 100).toFixed(1) + '%' + (s.stagnantGens > 0 ? ' (+' + s.stagnantGens + ' stg)' : '');
 
-    const B   = (v) => bar(v, 8);
+    const B = (v) => bar(v, 8);
     const GRP = (label) => '<span style="color:#444;font-size:10px">' + label + '</span>';
 
-    // rel-y can be negative (dino above obstacle = safe), bar() would clamp it to 0
     overlay.innerHTML = [
       '<b style="color:#fff;font-size:13px">DINO BOT' + modeBadge + '</b>',
       '<span style="color:#666;font-size:11px">mut: ' + mutStr + '</span>',
@@ -1016,6 +1030,7 @@ window.DinoBot = (() => {
       'ttc    ' + B(lastInputs[1]),
       'obs-y  ' + B(lastInputs[3]),
       'hgt    ' + B(lastInputs[4]),
+      'width  ' + B(lastInputs[12]),
       GRP('  obstacle 2 — ' + obs2Type),
       'dist2  ' + B(lastInputs[5]),
       'gap    ' + B(lastInputs[7]),
@@ -1735,7 +1750,7 @@ window.DinoBot = (() => {
     });
 
     // Input labels
-    const inLabels = ['d1', 'ttc', 'ty1', 'obY', 'hgt', 'd2', 'ty2', 'gap', 'spd', 'diY', 'vY', 'dck'];
+    const inLabels = ['d1', 'ttc', 'ty1', 'obY', 'hgt', 'd2', 'ty2', 'gap', 'spd', 'diY', 'vY', 'dck', 'wdt'];
     ctx.fillStyle  = '#555'; ctx.font = '8px monospace'; ctx.textAlign = 'right';
     nodes[0].forEach(({ x, y }, j) => ctx.fillText(inLabels[j] || '', x - R - 3, y + 3));
 
