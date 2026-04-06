@@ -112,7 +112,7 @@ class GeneticAlgorithm {
     mutationRate          = 0.12,
     mutationScale         = 0.25,
     eliteCount            = 3,
-    topology              = [12, 8, 2],
+    topology              = [13, 8, 2],
     autoSaveEvery         = 5,
     maxCheckpoints        = 10,
     crossoverRate         = 0.65,
